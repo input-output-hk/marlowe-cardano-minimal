@@ -43,17 +43,15 @@ module Language.Marlowe.Scripts
     MarloweInput
   , MarloweTxInput(..)
     -- * Semantics Validator
-  , TypedMarloweValidator
-  , alternateMarloweValidator
-  , alternateMarloweValidatorHash
-  , marloweValidator
-  , marloweValidatorCompiled
   , marloweValidatorHash
+  , marloweValidatorBytes
+  , marloweValidator
   , mkMarloweValidator
     -- * Payout Validator
-  , TypedRolePayoutValidator
-  , rolePayoutValidator
   , rolePayoutValidatorHash
+  , rolePayoutValidatorBytes
+  , rolePayoutValidator
+  , mkRolePayoutValidator
     -- * Utilities
   , marloweTxInputsFromInputs
   ) where
@@ -62,14 +60,7 @@ module Language.Marlowe.Scripts
 import GHC.Generics (Generic)
 import Language.Marlowe.Core.V1.Semantics as Semantics
 import Language.Marlowe.Core.V1.Semantics.Types as Semantics
-import Language.Marlowe.Pretty (Pretty(..))
-import Ledger.Typed.Scripts (unsafeMkTypedValidator)
-import qualified Plutus.Script.Utils.Typed as Scripts
-import Plutus.Script.Utils.V2.Typed.Scripts (mkTypedValidator)
-import qualified Plutus.Script.Utils.V2.Typed.Scripts as Scripts
-import qualified Plutus.V1.Ledger.Address as Address (scriptHashAddress)
-import qualified Plutus.V1.Ledger.Value as Val
-import Plutus.V2.Ledger.Api
+import PlutusLedgerApi.V2
   ( Credential(..)
   , CurrencySymbol
   , Datum(Datum)
@@ -85,19 +76,25 @@ import Plutus.V2.Ledger.Api
   , TxInInfo(TxInInfo, txInInfoOutRef, txInInfoResolved)
   , TxInfo(TxInfo, txInfoInputs, txInfoOutputs, txInfoValidRange)
   , UpperBound(..)
-  , ValidatorHash
-  , mkValidatorScript
+  , ScriptHash(..)
+  , SerialisedScript
+  , serialiseCompiledCode
   )
-import qualified Plutus.V2.Ledger.Api as Ledger (Address(Address))
-import Plutus.V2.Ledger.Contexts (findDatum, findDatumHash, txSignedBy, valueSpent)
-import Plutus.V2.Ledger.Tx (OutputDatum(OutputDatumHash), TxOut(TxOut, txOutAddress, txOutDatum, txOutValue))
-import PlutusTx (makeIsDataIndexed, makeLift)
-import qualified PlutusTx
-import qualified PlutusTx.AssocMap as AssocMap
+import PlutusLedgerApi.V2.Contexts (findDatum, findDatumHash, txSignedBy, valueSpent)
+import PlutusLedgerApi.V2.Tx (OutputDatum(OutputDatumHash), TxOut(TxOut, txOutAddress, txOutDatum, txOutValue))
+import PlutusTx (CompiledCode, makeIsDataIndexed, makeLift, unsafeFromBuiltinData)
 import PlutusTx.Plugin ()
 import PlutusTx.Prelude as PlutusTxPrelude hiding (traceError, traceIfFalse)
+
+import qualified Cardano.Crypto.Hash as Hash
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Short as SBS
+import qualified PlutusLedgerApi.V1.Address as Address (scriptHashAddress)
+import qualified PlutusLedgerApi.V1.Value as Val
+import qualified PlutusLedgerApi.V2 as Ledger (Address(Address))
+import qualified PlutusTx
+import qualified PlutusTx.AssocMap as AssocMap
 import qualified Prelude as Haskell
-import Unsafe.Coerce (unsafeCoerce)
 
 
 -- Suppress traces, in order to save bytes.
@@ -119,41 +116,16 @@ type MarloweInput = [MarloweTxInput]
 data TypedMarloweValidator
 
 
--- Datum and redeemer types for the Marlowe semantics validator.
--- [Marlowe-Cardano Specification: "Constraint 1. Typed validation".]
-instance Scripts.ValidatorTypes TypedMarloweValidator where
-    type instance RedeemerType TypedMarloweValidator = MarloweInput
-    type instance DatumType TypedMarloweValidator = MarloweData
-
-
 -- | Tag for the Marlowe payout validator.
 data TypedRolePayoutValidator
-
-
--- Datum and redeemer types for the Marlowe payout validator.
--- [Marlowe-Cardano Specification: "Constraint 16. Typed validation".]
-instance Scripts.ValidatorTypes TypedRolePayoutValidator where
-  type instance RedeemerType TypedRolePayoutValidator = ()
-  type instance DatumType TypedRolePayoutValidator = (CurrencySymbol, TokenName)
 
 
 -- | A single input applied in the Marlowe semantics validator.
 data MarloweTxInput = Input InputContent
                     | MerkleizedTxInput InputContent BuiltinByteString
   deriving stock (Haskell.Show,Haskell.Eq,Generic)
-  deriving anyclass (Pretty)
 
 
--- | The Marlowe payout validator.
-rolePayoutValidator :: Scripts.TypedValidator TypedRolePayoutValidator
-rolePayoutValidator = mkTypedValidator @TypedRolePayoutValidator
-  $$(PlutusTx.compile [|| mkRolePayoutValidator ||])
-  $$(PlutusTx.compile [|| wrap ||])
-  where
-    wrap = Scripts.mkUntypedValidator @_ @(CurrencySymbol, TokenName) @()
-
-
-{-# INLINABLE rolePayoutValidator #-}
 -- | The Marlowe payout validator.
 mkRolePayoutValidator :: (CurrencySymbol, TokenName)  -- ^ The datum is the currency symbol and role name for the payout.
                       -> ()                           -- ^ No redeemer is required.
@@ -163,11 +135,6 @@ mkRolePayoutValidator (currency, role) _ ctx =
     -- The role token for the correct currency must be present.
     -- [Marlowe-Cardano Specification: "17. Payment authorized".]
     Val.singleton currency role 1 `Val.leq` valueSpent (scriptContextTxInfo ctx)
-
-
--- | The hash of the Marlowe payout validator.
-rolePayoutValidatorHash :: ValidatorHash
-rolePayoutValidatorHash = Scripts.validatorHash rolePayoutValidator
 
 
 {-# INLINABLE closeInterval #-}
@@ -185,7 +152,7 @@ closeInterval _ = Nothing
 {-# INLINABLE mkMarloweValidator #-}
 -- | The Marlowe semantics validator.
 mkMarloweValidator
-    :: ValidatorHash  -- ^ The hash of the corresponding Marlowe payout validator.
+    :: ScriptHash     -- ^ The hash of the corresponding Marlowe payout validator.
     -> MarloweData    -- ^ The datum is the Marlowe parameters, state, and contract.
     -> MarloweInput   -- ^ The redeemer is the list of inputs applied to the contract.
     -> ScriptContext  -- ^ The script context.
@@ -303,7 +270,7 @@ mkMarloweValidator
 
     -- Check for the presence of multiple Marlowe validators or other Plutus validators.
     examineScripts
-      :: (ValidatorHash -> Bool)  -- Test for this validator.
+      :: (ScriptHash -> Bool)  -- Test for this validator.
       -> Maybe TxInInfo           -- The input for this validator, if found so far.
       -> Bool                     -- Whether no other validator has been found so far.
       -> [TxInInfo]               -- The inputs remaining to be examined.
@@ -328,7 +295,7 @@ mkMarloweValidator
     examineScripts f self others (_ : txs) = examineScripts f self others txs
 
     -- Check if inputs are being spent from the same script.
-    sameValidatorHash:: TxInInfo -> ValidatorHash -> Bool
+    sameValidatorHash:: TxInInfo -> ScriptHash -> Bool
     sameValidatorHash TxInInfo{txInInfoResolved=TxOut{txOutAddress=Ledger.Address (ScriptCredential vh1) _}} vh2 = vh1 == vh2
     sameValidatorHash _ _ = False
 
@@ -459,68 +426,6 @@ mkMarloweValidator
     valuePaidToAddress address = foldMap txOutValue $ filter ((== address) . txOutAddress) allOutputs
 
 
--- | The validator for Marlowe semantics.
---
--- This is pretty standard way to minimize size of the typed validator:
---  * Wrap validator function so it accepts raw `BuiltinData`.
---  * Create a validator which is simply typed.
---  * Create "typed by `Any` validator".
---  * Coerce it if you like. This step is not required - we only need `TypedValidator`.
-marloweValidator :: Scripts.TypedValidator TypedMarloweValidator
-marloweValidator =
-  let
-    mkUntypedMarloweValidator :: ValidatorHash -> BuiltinData -> BuiltinData -> BuiltinData -> ()
-    mkUntypedMarloweValidator rp = Scripts.mkUntypedValidator (mkMarloweValidator rp)
-
-    untypedValidator :: Scripts.Validator
-    untypedValidator = mkValidatorScript $
-      $$(PlutusTx.compile [|| mkUntypedMarloweValidator ||])
-        `PlutusTx.applyCode` PlutusTx.liftCode rolePayoutValidatorHash
-
-    typedValidator :: Scripts.TypedValidator Scripts.Any
-    typedValidator = unsafeMkTypedValidator (Scripts.Versioned untypedValidator Scripts.PlutusV2)
-  in
-    unsafeCoerce typedValidator
-
-
-marloweValidatorCompiled :: PlutusTx.CompiledCode (ValidatorHash -> PlutusTx.BuiltinData -> PlutusTx.BuiltinData -> PlutusTx.BuiltinData -> ())
-marloweValidatorCompiled =
-  let
-    mkUntypedMarloweValidator :: ValidatorHash -> PlutusTx.BuiltinData -> PlutusTx.BuiltinData -> PlutusTx.BuiltinData -> ()
-    mkUntypedMarloweValidator rp = Scripts.mkUntypedValidator (mkMarloweValidator rp)
-  in
-    $$(PlutusTx.compile [|| mkUntypedMarloweValidator ||])
-
-
--- | The hash of the Marlowe semantics validator.
-marloweValidatorHash :: ValidatorHash
-marloweValidatorHash = Scripts.validatorHash marloweValidator
-
-
-{-# DEPRECATED alternateMarloweValidator "This validator is too large. Use `marloweValidator` instead." #-}
--- | An alternative version of the Marlowe semantics validator that does uses straightforward validator
--- typing, but at the expense of a larger size.
-alternateMarloweValidator :: Scripts.TypedValidator TypedMarloweValidator
-alternateMarloweValidator = Scripts.mkTypedValidator
-    @TypedMarloweValidator
-    compiledMarloweValidator
-    compiledArgsValidator
-    where
-        compiledMarloweValidator =
-          $$(PlutusTx.compile [|| mkMarloweValidator ||])
-            `PlutusTx.applyCode`
-              PlutusTx.liftCode rolePayoutValidatorHash
-        mkArgsValidator = Scripts.mkUntypedValidator @_ @MarloweData @MarloweInput
-        compiledArgsValidator =
-          $$(PlutusTx.compile [|| mkArgsValidator ||])
-
-
-{-# DEPRECATED alternateMarloweValidatorHash "This validator is too large. Use `marloweValidatorHash` instead." #-}
--- | Hash of the alaternative Marlowe semantics validator.
-alternateMarloweValidatorHash :: ValidatorHash
-alternateMarloweValidatorHash = Scripts.validatorHash alternateMarloweValidator
-
-
 -- | Convert semantics input to transaction input.
 marloweTxInputFromInput :: Input -> MarloweTxInput
 marloweTxInputFromInput (NormalInput i)         = Input i
@@ -535,3 +440,66 @@ marloweTxInputsFromInputs = fmap marloweTxInputFromInput
 -- Lifting data types to Plutus Core
 makeLift ''MarloweTxInput
 makeIsDataIndexed ''MarloweTxInput [('Input,0),('MerkleizedTxInput,1)]
+
+
+-- | Compute the hash of a script.
+hashScript :: CompiledCode (BuiltinData -> BuiltinData -> BuiltinData -> ()) -> ScriptHash
+hashScript =
+  -- FIXME: Apparently this is the wrong recipe, since its hash disagrees with `cardano-cli`.
+  ScriptHash
+    . toBuiltin
+    . (Hash.hashToBytes :: Hash.Hash Hash.Blake2b_224 SBS.ShortByteString -> BS.ByteString)
+    . Hash.hashWith (BS.append "\x02" . SBS.fromShort)  -- For Plutus V2.
+    . serialiseCompiledCode
+
+
+{-# INLINABLE rolePayoutValidator #-}
+-- | The Marlowe payout validator.
+rolePayoutValidator :: CompiledCode (BuiltinData -> BuiltinData -> BuiltinData -> ())
+rolePayoutValidator =
+  $$(PlutusTx.compile [|| rolePayoutValidator' ||])
+    where
+      rolePayoutValidator' :: BuiltinData -> BuiltinData -> BuiltinData -> ()
+      rolePayoutValidator' d r p =
+        check
+          $ mkRolePayoutValidator
+            (unsafeFromBuiltinData d)
+            (unsafeFromBuiltinData r)
+            (unsafeFromBuiltinData p)
+
+
+-- | The serialisation of the Marlowe payout validator.
+rolePayoutValidatorBytes :: SerialisedScript
+rolePayoutValidatorBytes = serialiseCompiledCode rolePayoutValidator
+
+
+-- | The hash of the Marlowe payout validator.
+rolePayoutValidatorHash :: ScriptHash
+rolePayoutValidatorHash = hashScript rolePayoutValidator
+
+
+-- | The validator for Marlowe semantics.
+marloweValidator :: CompiledCode (BuiltinData -> BuiltinData -> BuiltinData -> ())
+marloweValidator =
+  let
+    marloweValidator' :: ScriptHash -> BuiltinData -> BuiltinData -> BuiltinData -> ()
+    marloweValidator' rpvh d r p =
+      check
+        $ mkMarloweValidator rpvh
+            (unsafeFromBuiltinData d)
+            (unsafeFromBuiltinData r)
+            (unsafeFromBuiltinData p)
+  in
+    fromMaybe (Haskell.error "Application of role-payout validator hash to marlowe validator failed.")
+      $ $$(PlutusTx.compile [|| marloweValidator' ||])
+      `PlutusTx.applyCode` PlutusTx.liftCode rolePayoutValidatorHash
+
+
+-- | The serialisation of the Marlowe semantics validator.
+marloweValidatorBytes :: SerialisedScript
+marloweValidatorBytes = serialiseCompiledCode marloweValidator
+
+
+-- | The hash of the Marlowe semantics validator.
+marloweValidatorHash :: ScriptHash
+marloweValidatorHash = hashScript marloweValidator

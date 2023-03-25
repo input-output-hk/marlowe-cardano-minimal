@@ -1,5 +1,5 @@
 cabal-version: 2.2
-name: marlowe-cardano
+name: marlowe-cardano-minimal
 version: 0.1.0.3
 license: Apache-2.0
 license-files:
@@ -50,43 +50,29 @@ library
 
   build-depends:
     base,
-    aeson,
-    base16-aeson,
-    base16-bytestring,
-    bech32,
     bytestring,
-    containers,
-    deriving-aeson,
-    mtl,
-    multiplate,
     newtype-generics,
-    ordered-containers,
-    plutus-ledger ^>= 1.2,
     plutus-ledger-api,
-    plutus-script-utils,
     plutus-tx,
-    sbv >=8.4,
-    scientific,
-    serialise,
-    template-haskell,
-    transformers,
-    text,
-    wl-pprint,
+    cardano-crypto-class >=2.0.0.1 && <2.2
 
   exposed-modules:
-    Language.Marlowe
-    Language.Marlowe.Extended.V1
-    Language.Marlowe.Extended.V1.Metadata.Types
-    Language.Marlowe.Core.V1.Plate
     Language.Marlowe.Core.V1.Semantics
     Language.Marlowe.Core.V1.Semantics.Types
     Language.Marlowe.Core.V1.Semantics.Types.Address
-    Language.Marlowe.FindInputs
-    Language.Marlowe.Client
-    Language.Marlowe.Client.History
-    Language.Marlowe.Util
-    Language.Marlowe.ParserUtil
     Language.Marlowe.Scripts
-    Language.Marlowe.Pretty
-    Language.Marlowe.Analysis.FSSemantics
-    Plutus.Debug
+
+
+executable marlowe-validators
+  import: lang
+  hs-source-dirs: app
+  main-is: Main.hs
+  build-depends:
+    base,
+    base16-bytestring,
+    bytestring,
+    containers,
+    marlowe-cardano-minimal,
+    mtl,
+    plutus-core,
+    plutus-ledger-api,
